@@ -231,7 +231,7 @@ def _draw_faces(ax, df, colors, shape, w, heel_pos=True):
 
 
 def _hi_label(heel_pos):
-    return "HI  (toe  <-  |  ->  heel)" if heel_pos else "HI  (heel  <-  |  ->  toe)"
+    return "HI [in]  (toe  <-  |  ->  heel)" if heel_pos else "HI [in]  (heel  <-  |  ->  toe)"
 
 
 def _flight_path(hla, offline, carry, n=48):
@@ -466,7 +466,7 @@ def draw_plot(fig, df, o, colors):
                 _draw_faces(a, df, colors, o.get("face_shape", FACE_SHAPES[0]),
                             o.get("face_w", 2.0), o.get("heel_pos", True))
                 a.set_aspect("equal", adjustable="datalim")
-                xc = "HI (toe <- | -> heel)" if o.get("heel_pos", True) else "HI (heel <- | -> toe)"
+                xc = "HI [in] (toe <- | -> heel)" if o.get("heel_pos", True) else "HI [in] (heel <- | -> toe)"
             if diag:
                 xl, yl = a.get_xlim(), a.get_ylim()
                 lo, hi = min(xl[0], yl[0]), max(xl[1], yl[1])
@@ -628,7 +628,7 @@ def draw_plot(fig, df, o, colors):
         _draw_faces(ax, df, fcol, o.get("face_shape", FACE_SHAPES[0]), o.get("face_w", 2.0), hp)
         ax.axhline(0, color="black", lw=1, alpha=.6)
         ax.axvline(0, color="black", lw=1, alpha=.6)
-        ax.set_xlabel(_hi_label(hp)); ax.set_ylabel("VI (vertical impact)")
+        ax.set_xlabel(_hi_label(hp)); ax.set_ylabel("VI [in]  (vertical impact)")
         ax.set_title("Impact location (ellipse = 1 sigma per club). Try Color by SmashFactor")
         ax.set_aspect("equal", adjustable="datalim")
 
@@ -651,11 +651,13 @@ def draw_plot(fig, df, o, colors):
 
 
 # --------------------------------------------------------------------------- shot summary
-# Units follow the GSPro UI: metres, km/h, degrees, rpm.  HI / VI (impact location) are millimetres.
+# Units follow the GSPro UI: metres, km/h, degrees, rpm.  The raw HI / VI (impact location) columns are
+# INCHES; the shot summary converts them to millimetres.
 STORY_BG = "#16211b"
 ZONE_RED, ZONE_YEL, ZONE_GRN = "#f6caca", "#fbf4bd", "#cbe6cb"
 KX = 3.0               # the story pictures exaggerate angles / lateral distances by this factor
 FACE_HALF_MM = 52.0    # driver face half-width (mm) for the real-scale club face picture
+IN_TO_MM = 25.4        # HI / VI in the CSV are inches
 
 
 def _ex(a):
@@ -958,8 +960,8 @@ def _face_panel(ax, row, ref, heel_pos):
     kind = _face_kind(str(row["Club"]))
     _face_outline(ax, kind, FACE_HALF_MM, "#4a4f5c", heel_pos)
     if {"HI", "VI"} <= set(ref.columns):
-        ax.scatter(ref["HI"], ref["VI"], s=7, color="#8a8f99", alpha=.4, zorder=2)
-    hi, vi = _nz(row.get("HI")), _nz(row.get("VI"))
+        ax.scatter(ref["HI"] * IN_TO_MM, ref["VI"] * IN_TO_MM, s=9, color="#8a8f99", alpha=.45, zorder=2)
+    hi, vi = _nz(row.get("HI")) * IN_TO_MM, _nz(row.get("VI")) * IN_TO_MM
     if np.isfinite(hi) and np.isfinite(vi):
         for s, a, c in ((520, .20, "#2b6cff"), (300, .30, "#2fd36b"), (160, .55, "#ffd93a"), (70, .95, "#ee2a1f")):
             ax.scatter([hi], [vi], s=s, color=c, alpha=a, zorder=5, linewidths=0)
@@ -1140,14 +1142,14 @@ def _summary_items(row, f, ref, heel_pos):
     aoa = _nz(row.get("AoA"))
     z = {"Driver": ([(1, 6)], [(-2, 1), (6, 9)]), "Hybrid": ([(-4, 0)], [(-7, -4), (0, 3)]),
          "Iron": ([(-6, -2)], [(-9, -6), (-2, 1)])}[kind]
-    hi, vi = _nz(row.get("HI")), _nz(row.get("VI"))
+    hi, vi = _nz(row.get("HI")) * IN_TO_MM, _nz(row.get("VI")) * IN_TO_MM       # inches -> mm
     toe = (-hi if heel_pos else hi) if fin(hi) else np.nan
     impact = [
         _mk("Angle of attack", "-" if not fin(aoa) else f"{aoa:.1f}°", aoa, -10, 10, z[0], z[1], "Low", "High"),
         _mk("Impact heel / toe", "-" if not fin(toe) else f"{abs(toe):.1f} mm {'Toe' if toe > 0 else 'Heel'}",
-            toe, -6, 6, [(-2.5, 2.5)], [(-4.5, 4.5)], "Heel", "Toe"),
+            toe, -50, 50, [(-10, 10)], [(-20, 20)], "Heel", "Toe"),
         _mk("Impact high / low", "-" if not fin(vi) else f"{abs(vi):.1f} mm {'High' if vi > 0 else 'Low'}",
-            vi, -6, 6, [(-2.5, 2.5)], [(-4.5, 4.5)], "Low", "High")]
+            vi, -50, 50, [(-10, 10)], [(-20, 20)], "Low", "High")]
     return launch, shape, impact
 
 
@@ -1330,7 +1332,7 @@ class App:
                          textvariable=self.face_w, command=self.refresh)
         sp.pack(side="left", padx=4)
         sp.bind("<Return>", lambda e: self.refresh())
-        ttk.Label(r, text="(HI/VI units)", foreground="#777").pack(side="left")
+        ttk.Label(r, text="(inches; 2.0 = driver)", foreground="#777").pack(side="left")
 
         # ball flight laws
         f = ttk.LabelFrame(left, text="Ball flight laws (A-I)", padding=4); f.pack(fill="x", pady=3)
