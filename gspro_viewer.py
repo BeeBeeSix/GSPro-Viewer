@@ -10,12 +10,17 @@ Usage:  python gspro_viewer.py [path/to/export.csv]
 import os
 import re
 import sys
+import textwrap
 
+import matplotlib
 import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
-from matplotlib.patches import Ellipse, Polygon, Rectangle, Wedge
-from matplotlib.colors import to_rgba
+from matplotlib.patches import Circle, Ellipse, FancyBboxPatch, Polygon, Rectangle, Wedge
+from matplotlib.ticker import MaxNLocator
+from matplotlib.colors import Normalize, to_rgba
+from matplotlib.cm import ScalarMappable
+from matplotlib.lines import Line2D
 
 try:
     import tkinter as tk
@@ -38,6 +43,7 @@ PLOT_KINDS = [
     "Face vs path (D-plane)",
     "Club face dashboard (6 panels)",
     "Ball flight laws (A-I grid)",
+    "Vertical trajectory (side view)",
 ]
 PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
            "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f"]
@@ -272,6 +278,88 @@ def _draw_flights(ax, d, o, colors):
                             arrowprops=dict(arrowstyle="-|>", color=col, lw=0, mutation_scale=22),
                             zorder=3.2)
     ax.plot(0, 0, marker="^", ms=9, color="black", zorder=4)          # tee / start
+
+
+def _side_path(carry, peak, vla, desc, n=60):
+    """Side-view flight (distance, height) rebuilt from carry, peak height, launch angle and descent
+    angle.  Rises with the launch slope to the peak, then falls to the landing point with the
+    descent slope; carry and peak height are hit exactly.  Returns (x, y, x_of_peak) or None."""
+    if not (np.isfinite(carry) and np.isfinite(peak)) or carry <= 0 or peak <= 0:
+        return None
+    t_up = np.tan(np.radians(vla)) if np.isfinite(vla) and vla > 0.5 else 4 * peak / (0.6 * carry)
+    t_dn = np.tan(np.radians(desc)) if np.isfinite(desc) and desc > 0.5 else 1.6 * t_up
+    t_up, t_dn = max(t_up, 1e-3), max(t_dn, 1e-3)
+    xp = carry * float(np.clip(t_dn / (t_dn + t_up), .35, .80))      # where the peak sits
+    p = float(np.clip(t_up * xp / peak, 1.2, 6.0))                    # shape of the climb
+    q = float(np.clip(t_dn * (carry - xp) / peak, 1.2, 6.0))          # shape of the descent
+    x1 = np.linspace(0, xp, n)
+    x2 = np.linspace(xp, carry, n)[1:]
+    y1 = peak * (1 - (1 - x1 / xp) ** p)
+    y2 = peak * (1 - ((x2 - xp) / (carry - xp)) ** q)
+    return np.r_[x1, x2], np.r_[y1, y2], xp
+
+
+def _side_plot(fig, ax, d, o, colors, pts):
+    """Vertical trajectories: thin line per shot + bold average flight per group (with roll)."""
+    cb = o["color_by"]
+    d = d.dropna(subset=["Carry", "PeakHeight"])
+    if d.empty:
+        ax.text(.5, .5, "No shots with carry / peak height", ha="center", va="center", transform=ax.transAxes)
+        return
+    cmap = norm = None
+    if cb == "Law":
+        groups = [(c, LAW_COLORS[c], g, f"{c}  {LAWS[c][0]}") for c, g in d.dropna(subset=["Law"]).groupby("Law")]
+    elif cb == "Club":
+        groups = [(c, colors[c], g, c) for c, g in d.groupby("Club", sort=False)]
+    else:
+        groups = [("all", PALETTE[0], d, "all shots")]
+        if cb != "(none)" and cb in d.columns:
+            v = d[cb].astype(float)
+            cmap, norm = matplotlib.colormaps["viridis"], Normalize(v.min(), v.max())
+    xmax = float(np.nanmax(d[["Carry", "TotalDistance"]].to_numpy(float))) if "TotalDistance" in d else float(d["Carry"].max())
+    ymax, handles = 1.0, []
+    for code, col, g, label in groups:
+        handles.append(Line2D([0], [0], color=col, lw=2.5, label=f"{label} ({len(g)})"))
+        for rec in g.to_dict("records"):
+            p = _side_path(rec["Carry"], rec["PeakHeight"], rec.get("VLA", np.nan), rec.get("Decent", np.nan))
+            if p is None:
+                continue
+            xs, ys, xp = p
+            c = col if cmap is None else cmap(norm(rec[cb]))
+            ax.plot(xs, ys, color=c, lw=.9, alpha=.5, zorder=2)
+            ymax = max(ymax, float(ys.max()))
+            law = f"  [{rec['Law']}]" if isinstance(rec.get("Law"), str) else ""
+            pts.append((xp, float(ys.max()),
+                        f"#{int(rec['Shot'])}  {rec['Club']}{law}\nCarry {rec['Carry']:.1f} m   Peak {rec['PeakHeight']:.1f} m\n"
+                        f"Launch {rec.get('VLA', np.nan):.1f}\u00b0   Descent {rec.get('Decent', np.nan):.1f}\u00b0"))
+        if o["means"] and len(g):
+            m = {k: float(g[k].mean()) for k in ("Carry", "PeakHeight", "VLA", "Decent", "TotalDistance") if k in g}
+            p = _side_path(m["Carry"], m["PeakHeight"], m.get("VLA", np.nan), m.get("Decent", np.nan))
+            if p is not None:
+                xs, ys, xp = p
+                ax.plot(xs, ys, color="white", lw=5.5, alpha=.9, zorder=3)
+                ax.plot(xs, ys, color=col, lw=3, zorder=3.1, solid_capstyle="round")
+                tot = m.get("TotalDistance", np.nan)
+                if np.isfinite(tot) and tot > m["Carry"]:
+                    ax.plot([m["Carry"], tot], [0, 0], color=col, lw=2.4, ls=(0, (4, 3)), zorder=3.1)
+                ax.scatter([xp], [m["PeakHeight"]], s=46, color=col, edgecolor="white", zorder=4)
+                ax.annotate(f"{m['PeakHeight']:.1f} m", (xp, m["PeakHeight"]), xytext=(0, 7),
+                            textcoords="offset points", ha="center", fontsize=8, fontweight="bold", color=col)
+                ymax = max(ymax, m["PeakHeight"])
+    ax.axhspan(-ymax, 0, color="#cfe6cf", alpha=.7, zorder=0)
+    ax.axhline(0, color="#5b8a5b", lw=1.4, zorder=1)
+    ax.set_xlim(-.01 * xmax, xmax * 1.03)
+    ax.set_ylim(-.04 * ymax, ymax * 1.15)
+    ax.set_xlabel("Distance (m)")
+    ax.set_ylabel("Height (m)")
+    ax.set_title("Vertical trajectory (side view): thin = each shot, bold = group mean (peak labelled, "
+                 "dashed = roll)", fontsize=10)
+    if cmap is not None:
+        fig.colorbar(ScalarMappable(norm, cmap), ax=ax, label=cb)
+    elif len(handles) > 1 or cb in ("Club", "Law"):
+        ax.legend(handles=handles, title="Flight law" if cb == "Law" else "Club")
+    if o["equal"]:
+        ax.set_aspect("equal", adjustable="datalim")
 
 
 def _law_grid(fig, df, o):
@@ -556,10 +644,596 @@ def draw_plot(fig, df, o, colors):
             _law_zones(ax, o)
         ax.set_xlabel("Path (deg)"); ax.set_ylabel("FaceToTarget (deg)")
         ax.set_title("Face vs path  (letters = ball flight law zones)"); ax.legend()
+
+    elif kind == PLOT_KINDS[11]:  # vertical trajectory (side view)
+        _side_plot(fig, ax, df, o, colors, pts)
     return pts
 
 
+# --------------------------------------------------------------------------- shot summary
+# Units follow the GSPro UI: metres, km/h, degrees, rpm.  HI / VI (impact location) are millimetres.
+STORY_BG = "#16211b"
+ZONE_RED, ZONE_YEL, ZONE_GRN = "#f6caca", "#fbf4bd", "#cbe6cb"
+KX = 3.0               # the story pictures exaggerate angles / lateral distances by this factor
+FACE_HALF_MM = 52.0    # driver face half-width (mm) for the real-scale club face picture
+
+
+def _ex(a):
+    """Exaggerate an angle (deg) for the story pictures so small angles stay readable."""
+    return float(np.degrees(np.arctan(KX * np.tan(np.radians(a)))))
+
+
+def _vec(a):
+    """Unit vector for a heading `a` degrees from the target line (up = target, + = right)."""
+    t = np.radians(a)
+    return np.array([np.sin(t), np.cos(t)])
+
+
+def _nz(v, default=np.nan):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return v if np.isfinite(v) else default
+
+
+def _robust(series):
+    """Median and a robust spread (scaled MAD) so mishits don't distort a club's usual range."""
+    v = pd.to_numeric(series, errors="coerce").dropna().to_numpy(float)
+    if len(v) == 0:
+        return np.nan, np.nan
+    med = float(np.median(v))
+    s = float(np.median(np.abs(v - med)) * 1.4826)
+    if not s > 0:
+        s = float(v.std()) if len(v) > 1 else 0.0
+    return med, s
+
+
+def flight_model(df):
+    """Two through-origin fits calibrated on the loaded shots (used for the 'optimal' values):
+         curve [m]  = kc * SideSpin * Carry      (lateral movement beyond the straight start line)
+         SideSpin   = ks * FaceToPath            (rpm per degree; face-to-path = face - path)"""
+    kc, ks, n = 4.3e-5, 190.0, 0          # fallbacks if the file has too few usable shots
+    need = ["Carry", "Offline", "HLA", "SideSpin", "FaceToTarget", "Path"]
+    if all(c in df.columns for c in need):
+        d = df
+        if "SmashFactor" in d.columns:
+            d = d[d["SmashFactor"] > 1.0]
+        d = d[d["Carry"] > 20].dropna(subset=need)
+        n = len(d)
+        if n >= 8:
+            curve = d["Offline"] - d["Carry"] * np.tan(np.radians(d["HLA"]))
+            x = d["SideSpin"] * d["Carry"]
+            f2p = d["FaceToTarget"] - d["Path"]
+            if (x * x).sum() > 0 and (f2p * f2p).sum() > 0:
+                a = (x * curve).sum() / (x * x).sum()
+                b = (f2p * d["SideSpin"]).sum() / (f2p * f2p).sum()
+                if a > 0 and b > 0:
+                    kc, ks = float(a), float(b)
+    return dict(kc=kc, ks=ks, n=n)
+
+
+def shot_facts(row, model):
+    g = lambda k: _nz(row.get(k))
+    path, face, hla = g("Path"), g("FaceToTarget"), g("HLA")
+    spin, carry, off = g("SideSpin"), g("Carry"), g("Offline")
+    f = dict(path=path, face=face, hla=hla, spin=spin, carry=carry, off=off,
+             total=g("TotalDistance"), f2p=face - path,        # + = face open to the path
+             curve=off - carry * np.tan(np.radians(hla)),      # lateral drift away from the start line
+             opt_spin=np.nan, opt_f2p=np.nan)
+    if all(np.isfinite([spin, off, carry])) and carry >= 5:
+        # spin that would have put this ball on the centre line, start line unchanged
+        f["opt_spin"] = spin - off / (model["kc"] * carry)
+        f["opt_f2p"] = f["f2p"] + (f["opt_spin"] - spin) / model["ks"]
+    return f
+
+
+def _path_name(p):
+    return "Out-to-in" if p <= -1 else "In-to-out" if p >= 1 else "Neutral"
+
+
+def _open_name(a, tol=0.5):
+    return "Square" if abs(a) <= tol else ("Open" if a > 0 else "Closed")
+
+
+def _lr(v, tol=0.0):
+    return "-" if not np.isfinite(v) else ("Left" if v < -tol else "Right" if v > tol else "Straight")
+
+
+# ---- story frames ---------------------------------------------------------------------------
+def _story_axes(ax, title):
+    ax.set_facecolor(STORY_BG)
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1.15, 1.15)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_color("#2d3b33")
+    ax.set_title(title, loc="left", fontsize=10, fontweight="bold")
+    ax.axvline(0, color="#6f8fa8", lw=1.1, ls=(0, (6, 6)), alpha=.75, zorder=1)
+
+
+def _ball(ax, x, y, r=.11):
+    ax.add_patch(Circle((x, y), r, fc="#e9e9ee", ec="#b9bcc6", lw=1, zorder=5))
+    ax.add_patch(Circle((x - .35 * r, y + .35 * r), .45 * r, fc="white", ec="none", alpha=.55, zorder=5.1))
+
+
+def _bar(ax, cx, cy, length, thick, ang, **kw):
+    """Club head drawn as a bar; `ang` = degrees CCW from +x.  Returns the heel (left) end."""
+    t = np.radians(ang)
+    ux, uy = np.cos(t), np.sin(t)
+    vx, vy = -uy, ux
+    hl, ht = length / 2, thick / 2
+    pts = [(cx - ux * hl - vx * ht, cy - uy * hl - vy * ht), (cx + ux * hl - vx * ht, cy + uy * hl - vy * ht),
+           (cx + ux * hl + vx * ht, cy + uy * hl + vy * ht), (cx - ux * hl + vx * ht, cy - uy * hl + vy * ht)]
+    ax.add_patch(Polygon(pts, closed=True, **kw))
+    return cx - ux * hl, cy - uy * hl
+
+
+def _story_flight(f, x0, y0, y1):
+    """Predicted flight drawn from (x0, y0) up to height y1 (lateral movement exaggerated xKX)."""
+    p = _flight_path(f["hla"], f["off"], f["carry"])
+    if p is None:
+        return np.array([x0, x0]), np.array([y0, y1])
+    s = (y1 - y0) / p[1][-1]
+    return np.clip(x0 + KX * p[0] * s, -.82, .82), y0 + p[1] * s
+
+
+def _card(ax, y_top, header, hcol, big, paras, result=None, w=1.84):
+    wrap = lambda s: textwrap.wrap(s, 40) or [""]
+    rl = wrap(result) if result else []
+    LN, RN = .092, .10
+    H = .06 + .105 + .20 + sum(LN * len(wrap(p)) + .035 for p in paras) + RN * len(rl) + .04
+    ax.add_patch(FancyBboxPatch((-w / 2, y_top - H), w, H, boxstyle="round,pad=0,rounding_size=.04",
+                                fc="#050a1a", ec="#2a3350", lw=1, alpha=.97, zorder=8))
+    y = y_top - .06
+    ax.text(0, y, header, color=hcol, fontsize=7.4, ha="center", va="top", zorder=9)
+    y -= .105
+    ax.text(0, y, big, color="white", fontsize=13, fontweight="bold", ha="center", va="top", zorder=9)
+    y -= .20
+    for p in paras:
+        for line in wrap(p):
+            ax.text(0, y, line, color="#c4ccd8", fontsize=7.2, ha="center", va="top", zorder=9)
+            y -= LN
+        y -= .035
+    for line in rl:
+        ax.text(0, y, line, color="white", fontsize=7.4, fontweight="bold", ha="center", va="top", zorder=9)
+        y -= RN
+    return y_top - H
+
+
+def _table_card(ax, y_top, rows, w=1.84):
+    """rows: (label, value, optimal_text | None), or None for a separator line."""
+    RH, OH, SH = .108, .082, .055
+    H = .06 + .14 + sum(SH if r is None else RH + (OH if r[2] else 0) for r in rows) + .04
+    ax.add_patch(FancyBboxPatch((-w / 2, y_top - H), w, H, boxstyle="round,pad=0,rounding_size=.04",
+                                fc="#050a1a", ec="#2a3350", lw=1, alpha=.97, zorder=8))
+    y = y_top - .06
+    ax.text(0, y, "FINAL RESULT", color="#9fb0c8", fontsize=7.4, ha="center", va="top", zorder=9)
+    y -= .14
+    for r in rows:
+        if r is None:
+            ax.plot([-w / 2 + .08, w / 2 - .08], [y - .01, y - .01], color="#2a3350", lw=.8, zorder=9)
+            y -= SH
+            continue
+        lab, val, opt = r
+        ax.text(-w / 2 + .08, y, lab, color="#9fb0c8", fontsize=7.3, ha="left", va="top", zorder=9)
+        ax.text(w / 2 - .08, y, val, color="white", fontsize=7.3, ha="right", va="top", zorder=9)
+        y -= RH
+        if opt:
+            ax.text(w / 2 - .08, y + .014, opt, color="#7be0b0", fontsize=6.8, ha="right", va="top", zorder=9)
+            y -= OH
+
+
+def _spin_arrows(ax, spin, centre=(0.0, -0.10), r=.19):
+    """Cyan arrows around the ball showing the side-spin direction (seen from above)."""
+    if not np.isfinite(spin) or abs(spin) < 150:
+        return
+    cw = spin > 0                                        # right spin = clockwise from above
+    rad = -.45 if cw else .45
+    cx, cy = centre
+    for sx, (y0, y1) in ((1, (.07, -.12)), (-1, (-.07, .12))):
+        a, b = (y0, y1) if cw else (y1, y0)
+        ax.annotate("", xy=(cx + sx * r, cy + b), xytext=(cx + sx * r, cy + a),
+                    arrowprops=dict(arrowstyle="-|>", color="#3ad0e0", lw=1.2, mutation_scale=9,
+                                    connectionstyle=f"arc3,rad={rad}"), zorder=7)
+
+
+def _story(axs, f):
+    pa, fa = _ex(f["path"]) if np.isfinite(f["path"]) else 0.0, _ex(f["face"]) if np.isfinite(f["face"]) else 0.0
+    B = np.array([0.0, -0.10])
+    pv = _vec(pa)
+    tail = B - 1.2 * pv
+    fin = np.isfinite
+    path, face, hla, spin, f2p = f["path"], f["face"], f["hla"], f["spin"], f["f2p"]
+
+    def base(ax, title, hl_path=False):
+        _story_axes(ax, title)
+        fx, fy = _story_flight(f, B[0], B[1], 1.12)
+        ax.plot(fx, fy, color="#f4f4f4", lw=1.1, alpha=.9, zorder=3)
+        if hl_path:
+            ax.plot([B[0], tail[0]], [B[1], tail[1]], color="#ff5a4f", lw=4, alpha=.35, zorder=2.5)
+        ax.plot([B[0], tail[0]], [B[1], tail[1]], color="#e5483f", lw=1.3, zorder=3)
+        _ball(ax, *B)
+
+    head = dict(fc="#59606e", ec="#9aa3b2", lw=1, zorder=4)
+
+    # 1 - start ---------------------------------------------------------------------------
+    ax = axs[0]
+    base(ax, "1/5  Start")
+    ax.text(-.94, -1.08, "— ball flight", color="#f4f4f4", fontsize=6.8, va="bottom", zorder=9)
+    ax.text(-.94, -.98, "— club path", color="#e5483f", fontsize=6.8, va="bottom", zorder=9)
+    ax.text(.94, -1.08, "target line - -", color="#6f8fa8", fontsize=6.8, va="bottom", ha="right", zorder=9)
+    ax.text(-.94, 1.08, f"angles and curve drawn x{KX:g}", color="#6e7d73", fontsize=6.5, ha="left", va="top")
+
+    # 2 - club path -----------------------------------------------------------------------
+    ax = axs[1]
+    base(ax, "2/5  Club path", hl_path=True)
+    A = B - .42 * pv
+    hx, hy = _bar(ax, A[0], A[1], .9, .075, -pa, **head)
+    ax.plot([hx, -1.05], [hy, hy], color="#7f8794", lw=1.2, zorder=3.5)
+    pn = _path_name(path) if fin(path) else "-"
+    desc = {"Out-to-in": "The club is travelling from the outside toward the inside through impact.",
+            "In-to-out": "The club is travelling from the inside toward the outside through impact.",
+            "Neutral": "The club is travelling along the target line through impact."}.get(pn, "")
+    _card(ax, 1.1, "CLUB PATH", "#ff7aa8", f"{pn} {abs(path):.1f}°" if fin(path) else "-", [desc])
+
+    # 3 - face to target ------------------------------------------------------------------
+    ax = axs[2]
+    base(ax, "3/5  Face to target")
+    A = B - .30 * pv
+    hx, hy = _bar(ax, A[0], A[1], .9, .075, -fa, fc="#59606e", ec="#4fd1c5", lw=1.6, zorder=4)
+    ax.plot([hx, -1.05], [hy, hy], color="#7f8794", lw=1.2, zorder=3.5)
+    ax.plot([A[0] - .45, A[0] + .45], [A[1], A[1]], color="white", lw=.8, ls=":", alpha=.35, zorder=3.6)
+    nv = _vec(fa)
+    ax.plot([A[0], A[0] + .55 * nv[0]], [A[1], A[1] + .55 * nv[1]], color="#4fd1c5", lw=1, ls=":", zorder=3.6)
+    fn = _open_name(face) if fin(face) else "-"
+    fdesc = {"Square": "The face is almost square to the target, so the ball should start close to the target line.",
+             "Open": "The face is open to the target (pointing right of it), so the ball should start right.",
+             "Closed": "The face is closed to the target (pointing left of it), so the ball should start left."}.get(fn, "")
+    start = "-" if not fin(hla) else ("on the target line" if abs(hla) <= 1 else "left" if hla < 0 else "right")
+    _card(ax, 1.1, "FACE TO TARGET", "#5aa9ff", f"{fn} {abs(face):.1f}°" if fin(face) else "-",
+          [fdesc, "Face angle is the biggest influence on where the ball starts."], f"Result: starts {start}.")
+
+    # 4 - face to path creates spin -------------------------------------------------------
+    ax = axs[3]
+    base(ax, "4/5  Face to path")
+    A = B - .30 * pv
+    hx, hy = _bar(ax, A[0], A[1], .9, .075, -fa, fc="#59606e", ec="#4fd1c5", lw=1.6, zorder=4)
+    ax.plot([hx, -1.05], [hy, hy], color="#7f8794", lw=1.2, zorder=3.5)
+    _bar(ax, A[0], A[1], .9, .075, -pa, fc="none", ec="#e5483f", lw=1, ls=":", zorder=4.1)
+    _spin_arrows(ax, spin)
+    pn2 = _open_name(f2p) if fin(f2p) else "-"
+    sdir = "-" if not fin(spin) else ("left" if spin < 0 else "right")
+    d2 = {"Square": "The face is square to the path, so there is little side spin and the ball flies straight.",
+          "Open": "The face is open relative to the path. That tilts the spin axis and creates right spin.",
+          "Closed": "The face is closed relative to the path. That tilts the spin axis and creates left spin."}.get(pn2, "")
+    res = ("Result: almost no side spin, flies straight." if fin(spin) and abs(spin) < 150
+           else f"Result: {sdir.capitalize()} {abs(spin):.0f} rpm, curves {sdir}." if fin(spin) else None)
+    y_end = _card(ax, 1.1, "FACE TO PATH CREATES SPIN", "#3ad0e0",
+                  f"{pn2} {abs(f2p):.1f}°" if fin(f2p) else "-", [d2], res)
+    if fin(f["opt_f2p"]):
+        o_dir = "left" if f["opt_spin"] < 0 else "right"
+        msg = textwrap.wrap(f"{_open_name(f['opt_f2p'])} {abs(f['opt_f2p']):.1f}\u00b0 \u2192 "
+                            f"{abs(f['opt_spin']):.0f} rpm {o_dir} = lands on centre line", 42)
+        hh = .16 + .09 * len(msg)
+        ax.add_patch(FancyBboxPatch((-.96, -1.12), 1.92, hh, boxstyle="round,pad=0,rounding_size=.04",
+                                    fc="#06161c", ec="#1f6f78", lw=1, zorder=8))
+        y = -1.12 + hh - .05
+        ax.text(-.9, y, "OPTIMAL FACE TO PATH", color="#3ad0e0", fontsize=6.8, va="top", zorder=9)
+        for line in msg:
+            y -= .09
+            ax.text(-.9, y - .015, line, color="#8ff0c8", fontsize=7.2, fontweight="bold", va="top", zorder=9)
+
+    # 5 - final result --------------------------------------------------------------------
+    ax = axs[4]
+    _story_axes(ax, "5/5  Final result")
+    fx, fy = _story_flight(f, 0.0, -1.1, .88)
+    ax.plot(fx, fy, color="#f4f4f4", lw=1.1, alpha=.9, zorder=3)
+    _ball(ax, fx[-1], fy[-1])
+    _spin_arrows(ax, spin, centre=(fx[-1], fy[-1]))
+    opt_f = (f"(Optimal {_open_name(f['opt_f2p'])} {abs(f['opt_f2p']):.1f}°)"
+             if fin(f["opt_f2p"]) else None)
+    opt_s = (f"(Optimal {_lr(f['opt_spin']).capitalize() if abs(f['opt_spin']) >= 1 else ''} "
+             f"{abs(f['opt_spin']):.0f} rpm)" if fin(f["opt_spin"]) else None)
+    num = lambda v, fmt: "-" if not fin(v) else fmt.format(v)
+    rows = [("Club path", f"{_path_name(path)} {abs(path):.1f}°" if fin(path) else "-", None),
+            ("Face angle", f"{_open_name(face)} {abs(face):.1f}°" if fin(face) else "-", None),
+            ("Face to path", f"{_open_name(f2p)} {abs(f2p):.1f}°" if fin(f2p) else "-", opt_f),
+            ("Push/pull", f"{'Left' if hla < 0 else 'Right'} {abs(hla):.1f}°" if fin(hla) else "-", None),
+            ("Side spin", f"{_lr(spin).capitalize()} {abs(spin):.0f} rpm" if fin(spin) else "-", opt_s),
+            None,
+            ("Carry", num(f["carry"], "{:.1f} m"), None),
+            ("Offline", f"{_lr(f['off'])} {abs(f['off']):.1f} m" if fin(f["off"]) else "-", None),
+            ("Curve", f"{_lr(f['curve'])} {abs(f['curve']):.1f} m" if fin(f["curve"]) else "-", None)]
+    _table_card(ax, .62, rows)
+
+
+# ---- club face + flight panels ---------------------------------------------------------------
+def _face_panel(ax, row, ref, heel_pos):
+    ax.set_title("Club face", loc="left", fontsize=10, fontweight="bold")
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    kind = _face_kind(str(row["Club"]))
+    _face_outline(ax, kind, FACE_HALF_MM, "#4a4f5c", heel_pos)
+    if {"HI", "VI"} <= set(ref.columns):
+        ax.scatter(ref["HI"], ref["VI"], s=7, color="#8a8f99", alpha=.4, zorder=2)
+    hi, vi = _nz(row.get("HI")), _nz(row.get("VI"))
+    if np.isfinite(hi) and np.isfinite(vi):
+        for s, a, c in ((520, .20, "#2b6cff"), (300, .30, "#2fd36b"), (160, .55, "#ffd93a"), (70, .95, "#ee2a1f")):
+            ax.scatter([hi], [vi], s=s, color=c, alpha=a, zorder=5, linewidths=0)
+        toe = -hi if heel_pos else hi
+        ax.text(.5, -.01, f"{abs(toe):.1f} mm {'toe' if toe > 0 else 'heel'}  ·  "
+                          f"{abs(vi):.1f} mm {'high' if vi > 0 else 'low'}\n(grey = other {row['Club']} shots)",
+                transform=ax.transAxes, ha="center", va="top", fontsize=7, color="#555")
+    ax.autoscale_view()
+
+
+def _flight_panel(ax, f, ref):
+    car, off, tot, hla = f["carry"], f["off"], f["total"], f["hla"]
+    ax.set_facecolor("#d8ecd8")
+    ax.grid(color="white", alpha=.7, lw=.8)
+    ax.axvline(0, color="#4d7a55", lw=1.2, zorder=1)
+    if {"Offline", "Carry"} <= set(ref.columns):
+        ax.scatter(ref["Offline"], ref["Carry"], s=8, color="#6f8a72", alpha=.4, zorder=2)
+    ex = off
+    ymax = max([v for v in (car, tot, 10.0) if np.isfinite(v)]) * 1.12
+    p = _flight_path(hla, off, car) if np.isfinite(car) and np.isfinite(off) else None
+    if p is not None:
+        ax.plot(p[0], p[1], color="#16202e", lw=2.2, zorder=4)
+        ax.scatter([off], [car], s=50, color="#16202e", zorder=5)
+        left = off > 0
+        ax.text(off, car, f"{car:.1f} m carry  " if left else f"  {car:.1f} m carry", fontsize=8,
+                va="bottom", ha="right" if left else "left", color="#16202e", zorder=6)
+        if np.isfinite(tot) and tot > car:
+            th = np.radians(hla if np.isfinite(hla) else 0.0)
+            psi = 2 * np.arctan2(off, car) - th              # heading at landing
+            ex, ey = off + (tot - car) * np.sin(psi), car + (tot - car) * np.cos(psi)
+            ax.plot([off, ex], [car, ey], color="#16202e", lw=1.8, ls=(0, (4, 3)), zorder=4)
+            ax.text(ex, ey, f"{tot:.1f} m total  " if ex > 0 else f"  {tot:.1f} m total", fontsize=8,
+                    va="bottom", ha="right" if ex > 0 else "left", color="#16202e", zorder=6)
+    ax.plot(0, 0, marker="^", ms=9, color="black", zorder=6)
+    lim = max(12.0, 1.4 * max(abs(off) if np.isfinite(off) else 0, abs(ex) if np.isfinite(ex) else 0))
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(0, ymax)
+    ax.set_xlabel("Offline (m)  ← left | right →", fontsize=8)
+    ax.set_ylabel("Distance (m)", fontsize=8)
+    ax.tick_params(labelsize=8)
+    ax.set_title("Flight (top-down)", loc="left", fontsize=10, fontweight="bold")
+
+
+# ---- range bars --------------------------------------------------------------------------------
+def _side_panel(ax, row, ref):
+    car, pk = _nz(row.get("Carry")), _nz(row.get("PeakHeight"))
+    vla, dec, tot = _nz(row.get("VLA")), _nz(row.get("Decent")), _nz(row.get("TotalDistance"))
+    ax.set_title("Flight (side view)", loc="left", fontsize=10, fontweight="bold")
+    ax.set_facecolor("#e9f2fb")
+    xmax = max([v for v in (car, tot, 10.0) if np.isfinite(v)])
+    ymax = max(pk if np.isfinite(pk) else 0.0, 1.0) * 1.4
+    if {"Carry", "PeakHeight"} <= set(ref.columns):                    # the club's other shots, faint
+        others = ref[ref["Shot"] != row["Shot"]]
+        if len(others) > 80:
+            others = others.sample(80, random_state=0)
+        for rec in others.to_dict("records"):
+            q = _side_path(rec["Carry"], rec["PeakHeight"], rec.get("VLA", np.nan), rec.get("Decent", np.nan))
+            if q is not None:
+                ax.plot(q[0], q[1], color="#7f93a8", lw=.7, alpha=.22, zorder=2)
+    ax.axhspan(-.32 * ymax, 0, color="#cfe6cf", zorder=1)
+    ax.axhline(0, color="#5b8a5b", lw=1.4, zorder=3)
+    p = _side_path(car, pk, vla, dec)
+    if p is not None:
+        xs, ys, xp = p
+        ax.fill_between(xs, 0, ys, color="#16202e", alpha=.07, zorder=3)
+        ax.plot(xs, ys, color="#16202e", lw=2.4, zorder=5)
+        ax.plot([xp, xp], [0, pk], color="#16202e", lw=.9, ls=":", zorder=4)
+        ax.scatter([xp], [pk], s=42, color="#d9480f", zorder=6)
+        ax.text(xp, pk + .04 * ymax, f"peak {pk:.1f} m", ha="center", va="bottom", fontsize=8,
+                color="#d9480f", fontweight="bold")
+        if np.isfinite(vla) and vla > 0:        # launch / descent tangents, readout in the corner
+            dx = .16 * car
+            ax.plot([0, dx], [0, dx * np.tan(np.radians(vla))], color="#d9480f", lw=1.2, ls="--", zorder=4)
+        if np.isfinite(dec) and dec > 0:
+            dx = .12 * car
+            ax.plot([car - dx, car], [dx * np.tan(np.radians(dec)), 0], color="#d9480f", lw=1.2, ls="--", zorder=4)
+        ax.text(.03, .97, f"launch {vla:.1f}\u00b0   descent {dec:.1f}\u00b0", transform=ax.transAxes,
+                ha="left", va="top", fontsize=8, color="#d9480f", fontweight="bold", zorder=7)
+        ax.scatter([car], [0], s=36, color="#16202e", zorder=6)
+        has_roll = np.isfinite(tot) and tot > car
+        ax.text(car, -.05 * ymax, f"carry {car:.1f} m", ha="right" if has_roll else "center",
+                va="top", fontsize=8, color="#16202e")
+        if has_roll:
+            ax.plot([car, tot], [0, 0], color="#16202e", lw=2, ls=(0, (4, 3)), zorder=5)
+            ax.text(tot, -.17 * ymax, f"total {tot:.1f} m", ha="right", va="top", fontsize=8, color="#16202e")
+    ax.plot(0, 0, marker="^", ms=8, color="black", zorder=6)
+    ax.set_xlim(-.02 * xmax, xmax * 1.04)
+    ax.set_ylim(-.32 * ymax, ymax)
+    ax.set_yticks([t for t in ax.get_yticks() if t >= 0])             # no negative heights
+    ax.set_xlabel("Distance (m)", fontsize=8)
+    ax.set_ylabel("Height (m)", fontsize=8)
+    ax.tick_params(labelsize=8)
+
+
+def _mk(name, vtxt, v, a, b, green, yellow, hl="", hr=""):
+    return dict(name=name, vtxt=vtxt, v=v, a=a, b=b, green=green, yellow=yellow, hl=hl, hr=hr)
+
+
+def _nice_ticks(a, b):
+    t = MaxNLocator(nbins=5, steps=[1, 2, 2.5, 5, 10]).tick_values(a, b)
+    return [x for x in t if a - 1e-9 <= x <= b + 1e-9]
+
+
+def _bar_group(ax, title, items, ncols=2):
+    ax.set_axis_off()
+    nrows = int(np.ceil(len(items) / ncols))
+    ax.set_xlim(0, ncols)
+    ax.set_ylim(0, nrows)
+    ax.set_title(title, loc="left", fontsize=10, fontweight="bold")
+    for i, it in enumerate(items):
+        r, c = divmod(i, ncols)
+        x0, w, yb = c + .03, .90, nrows - 1 - r
+        a, b = it["a"], it["b"]
+        pos = lambda v: float(np.clip((v - a) / (b - a), 0, 1))
+        ax.text(x0, yb + .96, it["name"], fontsize=8.5, fontweight="bold", va="top")
+        ax.text(x0 + w, yb + .96, it["vtxt"], fontsize=8.5, va="top", ha="right")
+        y0, h = yb + .36, .30
+        ax.add_patch(Rectangle((x0, y0), w, h, fc=ZONE_RED, ec="none"))
+        for rng_list, col in ((it["yellow"], ZONE_YEL), (it["green"], ZONE_GRN)):
+            for lo, hi in rng_list:
+                p0, p1 = pos(lo), pos(hi)
+                if p1 > p0:
+                    ax.add_patch(Rectangle((x0 + w * p0, y0), w * (p1 - p0), h, fc=col, ec="none"))
+        for t in _nice_ticks(a, b):
+            ax.plot([x0 + w * pos(t)] * 2, [y0, y0 + h], color="#b5a8a8", lw=.6, zorder=3)
+            ax.text(x0 + w * pos(t), y0 - .03, f"{t:g}", fontsize=6.5, ha="center", va="top", color="#666")
+        if it["hl"]:
+            ax.text(x0 + .01 * w, y0 + h / 2, it["hl"], fontsize=6.3, va="center", ha="left", color="#777", zorder=4)
+        if it["hr"]:
+            ax.text(x0 + .99 * w, y0 + h / 2, it["hr"], fontsize=6.3, va="center", ha="right", color="#777", zorder=4)
+        if np.isfinite(it["v"]):
+            xv = x0 + w * pos(it["v"])
+            ax.plot([xv, xv], [y0 - .05, y0 + h + .05], color="#2530d0", lw=2.4, zorder=5, solid_capstyle="butt")
+
+
+def _summary_items(row, f, ref, heel_pos):
+    kind = _face_kind(str(row["Club"]))
+    fin = np.isfinite
+
+    def perf(key, name, unit, nd, hl, hr, nonneg=True):
+        v = _nz(row.get(key))
+        c, s = _robust(ref[key]) if key in ref.columns else (np.nan, np.nan)
+        if not fin(c):
+            c = v if fin(v) else 0.0
+        if not (fin(s) and s > 0):
+            s = max(abs(c) * .1, 1.0)
+        a, b = c - 3 * s, c + 3 * s
+        if nonneg:
+            a = max(a, 0.0)
+        txt = "-" if not fin(v) else f"{v:.{nd}f}{unit}"
+        return _mk(name, txt, v, a, b, [(c - .7 * s, c + .7 * s)], [(c - 1.6 * s, c + 1.6 * s)], hl, hr)
+
+    launch = [perf("ClubSpeed", "Club speed", " km/h", 1, "Slow", "Fast"),
+              perf("BallSpeed", "Ball speed", " km/h", 1, "Slow", "Fast"),
+              perf("VLA", "Launch angle", "°", 1, "Low", "High", nonneg=False),
+              perf("BackSpin", "Backspin", " rpm", 0, "Low", "High"),
+              perf("PeakHeight", "Peak height", " m", 1, "Low", "High"),
+              perf("Decent", "Descent angle", "\u00b0", 1, "Shallow", "Steep"),
+              perf("Carry", "Carry", " m", 1, "Short", "Long"),
+              perf("TotalDistance", "Total distance", " m", 1, "Short", "Long")]
+
+    p, h, sp, off, f2p = f["path"], f["hla"], f["spin"], f["off"], f["f2p"]
+    c_f = f["opt_f2p"] if fin(f["opt_f2p"]) else 0.0
+    c_s = f["opt_spin"] if fin(f["opt_spin"]) else 0.0
+    lr = lambda v: "L" if v < 0 else "R"
+    shape = [
+        _mk("Club path", "-" if not fin(p) else f"{abs(p):.1f}° {lr(p)}  {_path_name(p)}", p, -12, 12,
+            [(-3, 3)], [(-6, 6)], "Out to in", "In to out"),
+        _mk("Face to path", "-" if not fin(f2p) else f"{abs(f2p):.1f}° {_open_name(f2p)}", f2p, -20, 20,
+            [(c_f - 1.5, c_f + 1.5)], [(c_f - 3.5, c_f + 3.5)], "Closed", "Open"),
+        _mk("Push / Pull", "-" if not fin(h) else f"{abs(h):.1f}° {lr(h)}", h, -10, 10,
+            [(-2, 2)], [(-4, 4)], "Pull (L)", "Push (R)"),
+        _mk("Sidespin", "-" if not fin(sp) else f"{abs(sp):.0f} rpm {lr(sp)}", sp, -6000, 6000,
+            [(c_s - 400, c_s + 400)], [(c_s - 1000, c_s + 1000)], "Left", "Right"),
+        _mk("Offline (carry)", "-" if not fin(off) else f"{abs(off):.1f} m {lr(off)}", off, -30, 30,
+            [(-5, 5)], [(-12, 12)], "Left", "Right")]
+
+    aoa = _nz(row.get("AoA"))
+    z = {"Driver": ([(1, 6)], [(-2, 1), (6, 9)]), "Hybrid": ([(-4, 0)], [(-7, -4), (0, 3)]),
+         "Iron": ([(-6, -2)], [(-9, -6), (-2, 1)])}[kind]
+    hi, vi = _nz(row.get("HI")), _nz(row.get("VI"))
+    toe = (-hi if heel_pos else hi) if fin(hi) else np.nan
+    impact = [
+        _mk("Angle of attack", "-" if not fin(aoa) else f"{aoa:.1f}°", aoa, -10, 10, z[0], z[1], "Low", "High"),
+        _mk("Impact heel / toe", "-" if not fin(toe) else f"{abs(toe):.1f} mm {'Toe' if toe > 0 else 'Heel'}",
+            toe, -6, 6, [(-2.5, 2.5)], [(-4.5, 4.5)], "Heel", "Toe"),
+        _mk("Impact high / low", "-" if not fin(vi) else f"{abs(vi):.1f} mm {'High' if vi > 0 else 'Low'}",
+            vi, -6, 6, [(-2.5, 2.5)], [(-4.5, 4.5)], "Low", "High")]
+    return launch, shape, impact
+
+
+# ---- the whole page ------------------------------------------------------------------------------
+def shot_summary(fig, row, ref, model, heel_pos=True):
+    """Draw the full shot summary (5-frame Shot Story, club face, flight, range bars) onto fig."""
+    fig.clear()
+    f = shot_facts(row, model)
+    outer = fig.add_gridspec(3, 1, height_ratios=[4.0, 2.9, 2.1], hspace=.40,
+                             left=.025, right=.985, top=.92, bottom=.04)
+    g0 = outer[0].subgridspec(1, 5, wspace=.10)                                   # the 5 story frames
+    g1 = outer[1].subgridspec(1, 4, width_ratios=[.75, 1.1, 1.35, 2.0], wspace=.36)
+    g2 = outer[2].subgridspec(1, 2, width_ratios=[3, 2], wspace=.12)
+    axs = [fig.add_subplot(g0[0, i]) for i in range(5)]
+    _story(axs, f)
+    _face_panel(fig.add_subplot(g1[0, 0]), row, ref, heel_pos)
+    _flight_panel(fig.add_subplot(g1[0, 1]), f, ref)
+    _side_panel(fig.add_subplot(g1[0, 2]), row, ref)
+    launch, shape, impact = _summary_items(row, f, ref, heel_pos)
+    _bar_group(fig.add_subplot(g1[0, 3]), "Launch & Distance", launch)
+    _bar_group(fig.add_subplot(g2[0, 0]), "Shape & Direction", shape)
+    _bar_group(fig.add_subplot(g2[0, 1]), "Impact & Contact", impact)
+    law = row.get("Law")
+    law_txt = f"   ·   Law {law}  {LAWS[law][0]}" if isinstance(law, str) and law in LAWS else ""
+    fig.text(.025, .965, f"{row['Club']}   ·   Shot #{int(row['Shot'])}{law_txt}",
+             fontsize=15, fontweight="bold", va="center")
+    topin = _nz(row.get("DistanceToPin"))
+    fig.text(.985, .965, "" if not np.isfinite(topin) else f"to pin {topin:.1f} m", fontsize=10,
+             ha="right", va="center", color="#555")
+    fig.text(.985, .008,
+             f"Story angles drawn x{KX:g}. 'Optimal' = spin / face-to-path that would put this ball on the centre line, "
+             f"estimated from {model['n']} shots in this file. Bars: performance = this club's median ± spread; "
+             f"direction = fixed bands.", fontsize=6.5, ha="right", color="#777")
+
+
 # --------------------------------------------------------------------------- GUI
+class SummaryWindow:
+    """Pop-up shot summary: 5-frame Shot Story + club face + flight + range bars.
+    Left / Right arrow keys (or the buttons) step through the shots in the Data table order."""
+
+    def __init__(self, app, shots, idx):
+        self.app, self.shots, self.idx = app, shots, idx
+        self.win = tk.Toplevel(app.root)
+        self.win.geometry("1500x1010")
+        bar = ttk.Frame(self.win)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="\u25C0 Prev", command=lambda: self.step(-1)).pack(side="left", padx=4, pady=3)
+        self.lbl = ttk.Label(bar, text="")
+        self.lbl.pack(side="left", padx=8)
+        ttk.Button(bar, text="Next \u25B6", command=lambda: self.step(1)).pack(side="left")
+        ttk.Button(bar, text="Save image...", command=self.save).pack(side="right", padx=4)
+        self.fig = Figure(figsize=(15, 10.2), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.win)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        for key, d in (("<Left>", -1), ("<Right>", 1)):
+            self.win.bind(key, lambda e, d=d: self.step(d))
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self.win.focus_set()
+        self.draw()
+
+    def step(self, d):
+        self.idx = (self.idx + d) % len(self.shots)
+        self.draw()
+
+    def draw(self):
+        app = self.app
+        cls = app.cls
+        shot = self.shots[self.idx]
+        row = cls[cls["Shot"] == shot].iloc[0]
+        keep = cls[~cls["Shot"].isin(app.disabled)]
+        ref = keep[keep["Club"] == row["Club"]]
+        if ref.empty:
+            ref = cls[cls["Club"] == row["Club"]]
+        shot_summary(self.fig, row, ref, flight_model(keep), app.hi_pos.get() == "Heel")
+        self.lbl.config(text=f"Shot #{shot}    ({self.idx + 1} / {len(self.shots)})    "
+                             f"use the \u2190 \u2192 keys to step through shots")
+        self.win.title(f"Shot summary - #{shot} {row['Club']}")
+        self.canvas.draw_idle()
+
+    def save(self):
+        p = filedialog.asksaveasfilename(defaultextension=".png",
+                                         filetypes=[("PNG image", "*.png"), ("PDF", "*.pdf")])
+        if p:
+            self.fig.savefig(p, dpi=150)
+
+
 class App:
     def __init__(self, root, path=None):
         self.root = root
@@ -715,7 +1389,8 @@ class App:
         df_ = ttk.Frame(nb); nb.add(df_, text="Data")
         tb = ttk.Frame(df_); tb.pack(fill="x", padx=4, pady=3)
         ttk.Label(tb, text="Click a box in the Off column (or select rows + Space) to disable a "
-                           "shot. Click a heading to sort.", foreground="#555").pack(side="left")
+                           "shot. Click a heading to sort. Right-click a row for its shot summary.",
+                  foreground="#555").pack(side="left")
         ttk.Button(tb, text="Enable all", command=self.enable_all).pack(side="right")
         ttk.Button(tb, text="Enable selected",
                    command=lambda: self._toggle(self.tree.selection(), False)).pack(side="right", padx=3)
@@ -724,6 +1399,8 @@ class App:
         self.tree = ttk.Treeview(df_, show="headings", selectmode="extended")
         self.tree.tag_configure("off", foreground="#a0a0a0")
         self.tree.bind("<Button-1>", self._tree_click)
+        for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):   # right-click (Win/Linux/macOS)
+            self.tree.bind(seq, self._tree_menu)
         self.tree.bind("<space>", lambda e: (self._toggle(self.tree.selection()), "break")[1])
         vs = ttk.Scrollbar(df_, orient="vertical", command=self.tree.yview)
         hs = ttk.Scrollbar(df_, orient="horizontal", command=self.tree.xview)
@@ -919,6 +1596,30 @@ class App:
         if iid:
             self._toggle([iid])
             return "break"
+
+    def _tree_menu(self, ev):
+        iid = self.tree.identify_row(ev.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        m = tk.Menu(self.tree, tearoff=0)
+        m.add_command(label=f"Shot summary  (#{iid})...", command=lambda: self.open_summary(iid))
+        m.add_separator()
+        m.add_command(label="Disable / enable selected shot(s)",
+                      command=lambda: self._toggle(self.tree.selection()))
+        try:
+            m.tk_popup(ev.x_root, ev.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
+    def open_summary(self, iid):
+        if self.cls is None:
+            return
+        shots = [int(i) for i in self.tree.get_children()]       # current table order
+        if int(iid) in shots:
+            SummaryWindow(self, shots, shots.index(int(iid)))
 
     def _toggle(self, iids, state=None):
         """state None = flip, True = disable, False = enable."""
