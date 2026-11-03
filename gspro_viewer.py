@@ -14,7 +14,7 @@ import sys
 import numpy as np
 import pandas as pd
 from matplotlib.figure import Figure
-from matplotlib.patches import Ellipse, Polygon
+from matplotlib.patches import Ellipse, Polygon, Rectangle, Wedge
 from matplotlib.colors import to_rgba
 
 try:
@@ -37,6 +37,7 @@ PLOT_KINDS = [
     "Impact location (HI vs VI)",
     "Face vs path (D-plane)",
     "Club face dashboard (6 panels)",
+    "Ball flight laws (A-I grid)",
 ]
 PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
            "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f"]
@@ -71,6 +72,37 @@ def numeric_columns(df):
 def club_colors(df):
     clubs = list(dict.fromkeys(df["Club"]))  # order of first appearance
     return {c: PALETTE[i % len(PALETTE)] for i, c in enumerate(clubs)}
+
+
+# ---- Ball flight laws: the 9-way A-I chart (start line x curve), right-hander
+# code: (name, start -1 pull / 0 straight / +1 push, curve -1 draw-hook / 0 straight / +1 fade-slice)
+LAWS = {"A": ("Pull Draw/Hook", -1, -1), "B": ("Pull", -1, 0), "C": ("Pull Fade/Slice", -1, 1),
+        "D": ("Straight Draw/Hook", 0, -1), "E": ("Straight", 0, 0), "F": ("Straight Slice", 0, 1),
+        "G": ("Push Draw", 1, -1), "H": ("Push", 1, 0), "I": ("Push Fade/Slice", 1, 1)}
+LAW_GRID = [["F", "E", "D"], ["I", "H", "G"], ["C", "B", "A"]]      # layout of the chart
+LAW_COLORS = {"A": "#b71c1c", "B": "#e53935", "C": "#ff8a80",        # pulls  = reds
+              "D": "#1b5e20", "E": "#43a047", "F": "#81c784",        # straight = greens
+              "G": "#0d47a1", "H": "#1e88e5", "I": "#64b5f6"}        # pushes = blues
+LAW_BY = {(s, c): k for k, (_, s, c) in LAWS.items()}
+LAW_SOURCES = ["Club face (FaceToTarget)", "Ball start (HLA)"]
+
+
+def add_flight_laws(df, face_tol=1.0, curve_tol=1.0, source=LAW_SOURCES[0]):
+    """Adds 'Law' (A-I) and 'LawName'.  start = FaceToTarget (or HLA); curve = face-to-path =
+    FaceToTarget - Path (+ = face open to path = fade/slice).  Bands are +/- tolerances in deg."""
+    d = df.copy()
+    col = "HLA" if source.startswith("Ball") else "FaceToTarget"
+    if not {col, "FaceToTarget", "Path"} <= set(d.columns):
+        d["Law"], d["LawName"] = np.nan, np.nan
+        return d
+    start = d[col].to_numpy(float)
+    curve = (d["FaceToTarget"] - d["Path"]).to_numpy(float)
+    s = np.where(start < -face_tol, -1, np.where(start > face_tol, 1, 0))
+    c = np.where(curve < -curve_tol, -1, np.where(curve > curve_tol, 1, 0))
+    ok = ~(np.isnan(start) | np.isnan(curve))
+    d["Law"] = [LAW_BY[(a, b)] if k else np.nan for a, b, k in zip(s, c, ok)]
+    d["LawName"] = d["Law"].map(lambda k: LAWS[k][0] if isinstance(k, str) else np.nan)
+    return d
 
 
 def filter_df(df, clubs, filters):
@@ -196,12 +228,126 @@ def _hi_label(heel_pos):
     return "HI  (toe  <-  |  ->  heel)" if heel_pos else "HI  (heel  <-  |  ->  toe)"
 
 
+def _flight_path(hla, offline, carry, n=48):
+    """Top-down flight line from the tee (0, 0) to the landing point (offline, carry).
+    Starts along the launch direction `hla` (deg, + = right of target) and bends with constant
+    curvature (circular arc) so it lands exactly on (offline, carry)."""
+    chord = np.hypot(offline, carry)
+    if not np.isfinite(chord) or chord <= 0 or carry <= 0:
+        return None
+    th = np.radians(hla if np.isfinite(hla) else 0.0)
+    ph = np.arctan2(offline, carry)             # direction of the chord (from the target line)
+    u = np.linspace(0, 1, n)
+    psi = th + u * 2 * (ph - th)                # heading turns linearly -> circular arc
+    dx, dy = np.sin(psi), np.cos(psi)
+    x = np.r_[0, np.cumsum((dx[1:] + dx[:-1]) / 2)]
+    y = np.r_[0, np.cumsum((dy[1:] + dy[:-1]) / 2)]
+    raw = np.hypot(x[-1], y[-1])
+    if raw < 1e-9:
+        return np.linspace(0, offline, n), np.linspace(0, carry, n)
+    k = chord / raw                             # chord direction is ph by symmetry
+    return x * k, y * k
+
+
+def _draw_flights(ax, d, o, colors):
+    """Flight lines for every shot (thin) + a bold average flight per group (club / law / all)."""
+    cb = o["color_by"]
+    if cb == "Law":
+        groups = [(c, LAW_COLORS[c], g) for c, g in d.dropna(subset=["Law"]).groupby("Law")]
+    elif cb == "Club":
+        groups = [(c, colors[c], g) for c, g in d.groupby("Club", sort=False)]
+    else:
+        groups = [("all", "#444444", d)]
+    for _, col, g in groups:
+        for hla, off, car in zip(g["HLA"], g["Offline"], g["Carry"]):
+            p = _flight_path(hla, off, car)
+            if p is not None:
+                ax.plot(p[0], p[1], color=col, lw=.9, alpha=.35, zorder=.9, solid_capstyle="round")
+        if o["means"] and len(g):
+            p = _flight_path(g["HLA"].mean(), g["Offline"].mean(), g["Carry"].mean())
+            if p is not None:
+                ax.plot(p[0], p[1], color="white", lw=5.5, alpha=.9, zorder=3)
+                ax.plot(p[0], p[1], color=col, lw=3, zorder=3.1, solid_capstyle="round")
+                ax.annotate("", xy=(p[0][-1], p[1][-1]), xytext=(p[0][-4], p[1][-4]),
+                            arrowprops=dict(arrowstyle="-|>", color=col, lw=0, mutation_scale=22),
+                            zorder=3.2)
+    ax.plot(0, 0, marker="^", ms=9, color="black", zorder=4)          # tee / start
+
+
+def _law_grid(fig, df, o):
+    """The chart: 3x3 cells F E D / I H G / C B A, each with the mean club face (black) and
+    club path (red) of the shots in that category, plus counts."""
+    d = df.dropna(subset=["Law"])
+    N = len(d)
+    ft, ct = o.get("face_tol", 1.0), o.get("curve_tol", 1.0)
+    kx = 2.0                                           # angle exaggeration so arrows are readable
+    maxn = max([int((d["Law"] == k).sum()) for k in LAWS] + [1])
+    for r, row in enumerate(LAW_GRID):
+        for c, code in enumerate(row):
+            ax = fig.add_subplot(3, 3, r * 3 + c + 1)
+            name, s, cv = LAWS[code]
+            g = d[d["Law"] == code]
+            n = len(g)
+            ax.set_xlim(-1.25, 1.25); ax.set_ylim(-1.0, 1.0)
+            ax.set_aspect("equal"); ax.axis("off")
+            col = LAW_COLORS[code]
+            ax.add_patch(Rectangle((-1.25, -1.0), 2.5, 2.0, fc=to_rgba(col, .06 + .5 * n / maxn),
+                                   ec=to_rgba(col, .9), lw=1.6, zorder=0))
+            ax.plot([-1.2, 1.2], [0, 0], ls="--", color="#999", lw=1, zorder=1)   # target line
+            if n:
+                face, path, a = g["FaceToTarget"].mean(), g["Path"].mean(), 1.0
+            else:                                       # idealised picture for an empty cell
+                face = s * 4.0; path = face - cv * 6.0; a = .25
+            fa, pa = np.radians(face * kx), np.radians(path * kx)
+            ax.add_patch(Wedge((0, 0), .34, np.degrees(-fa) - 90, np.degrees(-fa) + 90,
+                               fc="#222222", ec="none", alpha=.9 * a if n else .15, zorder=2))
+            for ang, colr in ((pa, "#e00000"), (fa, "black")):
+                dx, dy = -np.cos(ang), np.sin(ang)      # target = left, +angle (right of target) = up
+                ax.annotate("", xy=(.95 * dx, .95 * dy), xytext=(-.95 * dx, -.95 * dy),
+                            arrowprops=dict(arrowstyle="-|>", color=colr, lw=2.4,
+                                            mutation_scale=16, alpha=a), zorder=3)
+            ax.text(0, .96, f"{code}   {name}", ha="center", va="top", fontsize=10,
+                    fontweight="bold", color="black", zorder=4)
+            if n:
+                txt = (f"n = {n}  ({100 * n / N:.0f}%)\nface {face:+.1f}\u00b0   path {path:+.1f}\u00b0   "
+                       f"F-P {face - path:+.1f}\u00b0")
+            else:
+                txt = "no shots"
+            ax.text(0, -.96, txt, ha="center", va="bottom", fontsize=8, color="#222", zorder=4)
+    fig.suptitle(f"Ball flight laws  -  {N} shots   |   black = club face, red = club path "
+                 f"(angles drawn x{kx:g}, means per category)   |   straight band: start +/-{ft:g}\u00b0, "
+                 f"curve +/-{ct:g}\u00b0", fontsize=10)
+
+
+def _law_zones(ax, o):
+    """Overlay the 9 chart zones on the Path (x) vs FaceToTarget (y) plot."""
+    ft, ct = o.get("face_tol", 1.0), o.get("curve_tol", 1.0)
+    xl, yl = ax.get_xlim(), ax.get_ylim()
+    for yv in (-ft, ft):
+        ax.axhline(yv, color="#888", lw=.8, ls="--", alpha=.6)
+    xs = np.array(xl)
+    for cv in (-ct, ct):                                # face - path = cv  ->  y = x + cv
+        ax.plot(xs, xs + cv, color="#888", lw=.8, ls="--", alpha=.6)
+    ax.set_xlim(xl); ax.set_ylim(yl)
+    yc = {-1: (yl[0] - ft) / 2, 0: 0.0, 1: (ft + yl[1]) / 2}
+    span = xl[1] - xl[0]
+    for code, (_, s, c) in LAWS.items():
+        y0 = yc[s]
+        x0 = y0 - c * (ct + .18 * span)
+        if xl[0] < x0 < xl[1] and yl[0] < y0 < yl[1]:
+            ax.text(x0, y0, code, ha="center", va="center", fontsize=16, fontweight="bold",
+                    color=LAW_COLORS[code], alpha=.55, zorder=0)
+
+
 def draw_plot(fig, df, o, colors):
     """Render onto fig. o: dict(kind,x,y,color_by,bins,trend,equal,means).
     Returns list of (x, y, label) points for hover tooltips (may be empty)."""
     fig.clear()
     pts = []
     kind, x, y = o["kind"], o["x"], o["y"]
+    if "Law" not in df.columns:
+        df = add_flight_laws(df, o.get("face_tol", 1.0), o.get("curve_tol", 1.0),
+                             o.get("law_src", LAW_SOURCES[0]))
     if df.empty:
         fig.add_subplot(111).text(.5, .5, "No shots match the current filters",
                                   ha="center", va="center", transform=fig.gca().transAxes)
@@ -244,12 +390,17 @@ def draw_plot(fig, df, o, colors):
         fig.suptitle(f"Club face dashboard ({len(df)} shots; X = club mean)")
         return pts
 
+    if kind == PLOT_KINDS[10]:  # ball flight laws grid
+        _law_grid(fig, df, o)
+        return pts
+
     ax = fig.add_subplot(111)
     ax.grid(alpha=.25)
     groups = list(df.groupby("Club", sort=False))
 
     def tip(row, xc, yc):
-        return f"#{int(row['Shot'])}  {row['Club']}\n{xc}: {row[xc]:.2f}\n{yc}: {row[yc]:.2f}"
+        law = f"  [{row['Law']}]" if isinstance(row.get("Law"), str) else ""
+        return f"#{int(row['Shot'])}  {row['Club']}{law}\n{xc}: {row[xc]:.2f}\n{yc}: {row[yc]:.2f}"
 
     def scatter_xy(xc, yc, s=38):
         cb = o["color_by"]
@@ -264,6 +415,14 @@ def draw_plot(fig, df, o, colors):
                     ax.scatter(g[xc].mean(), g[yc].mean(), marker="X", s=140,
                                color=colors[club], edgecolor="black", linewidth=1.2, zorder=5)
             ax.legend(title="Club")
+        elif cb == "Law":
+            for code in sorted(d["Law"].dropna().unique()):
+                g = d[d["Law"] == code]
+                ax.scatter(g[xc], g[yc], s=s, color=LAW_COLORS[code], alpha=.9, edgecolor="white",
+                           linewidth=.5, label=f"{code}  {LAWS[code][0]} ({len(g)})")
+            ax.legend(title="Flight law", fontsize=8)
+            if o["trend"]:
+                _trend(ax, d[xc].values, d[yc].values, "black")
         elif cb == "(none)":
             ax.scatter(d[xc], d[yc], s=s, color=PALETTE[0], alpha=.85,
                        edgecolor="white", linewidth=.5)
@@ -332,14 +491,25 @@ def draw_plot(fig, df, o, colors):
 
     elif kind == PLOT_KINDS[5]:
         d = df.dropna(subset=["Offline", "Carry"])
-        o2 = dict(o, color_by=o["color_by"])
         scatter_xy("Offline", "Carry", s=42)
+        if o.get("flight_lines") and {"HLA", "Offline", "Carry"} <= set(d.columns):
+            _draw_flights(ax, d, o, colors)
+        grouped = "club"
         if o["color_by"] == "Club":
             for club, g in d.groupby("Club", sort=False):
                 _cov_ellipse(ax, g["Offline"].values, g["Carry"].values, colors[club])
+        elif o["color_by"] == "Law":                 # ball flight law groups A-I
+            grouped = "flight law"
+            for code, g in d.dropna(subset=["Law"]).groupby("Law"):
+                _cov_ellipse(ax, g["Offline"].values, g["Carry"].values, LAW_COLORS[code])
+                ax.text(g["Offline"].mean(), g["Carry"].mean(), code, ha="center", va="center",
+                        fontsize=15, fontweight="bold", color=LAW_COLORS[code], zorder=6,
+                        bbox=dict(boxstyle="circle,pad=.15", fc="white", ec=LAW_COLORS[code],
+                                  lw=1.4, alpha=.9))
         ax.axvline(0, color="black", lw=1, alpha=.6)
         ax.set_xlabel("Offline"); ax.set_ylabel("Carry")
-        ax.set_title("Dispersion (ellipse = 1 sigma per club)")
+        ax.set_title(f"Dispersion (ellipse = 1 sigma per {grouped}"
+                     + ("; letter = group mean)" if grouped == "flight law" else ")"))
         if o["equal"]:
             ax.set_aspect("equal", adjustable="datalim")
 
@@ -382,8 +552,10 @@ def draw_plot(fig, df, o, colors):
         ax.set_xlim(xl); ax.set_ylim(yl)
         ax.axhline(0, color="black", lw=.8, alpha=.5)
         ax.axvline(0, color="black", lw=.8, alpha=.5)
+        if not o.get("law_src", LAW_SOURCES[0]).startswith("Ball"):
+            _law_zones(ax, o)
         ax.set_xlabel("Path (deg)"); ax.set_ylabel("FaceToTarget (deg)")
-        ax.set_title("Face vs path"); ax.legend()
+        ax.set_title("Face vs path  (letters = ball flight law zones)"); ax.legend()
     return pts
 
 
@@ -399,6 +571,7 @@ class App:
         self.disabled = set()      # Shot numbers switched off in the Data tab
         self.sort_col, self.sort_asc = None, True
         self.active = None         # filtered AND enabled shots (what gets plotted)
+        self.cls = None            # all shots + Law/LawName columns
         self.filtered = None
         self.pts = []
         self.colors = {}
@@ -410,8 +583,29 @@ class App:
 
     # ---- layout
     def _build_ui(self):
-        left = ttk.Frame(self.root, padding=6)
-        left.pack(side="left", fill="y")
+        outer = ttk.Frame(self.root)
+        outer.pack(side="left", fill="y")
+        lc = tk.Canvas(outer, width=310, highlightthickness=0)
+        lsb = ttk.Scrollbar(outer, orient="vertical", command=lc.yview)
+        left = ttk.Frame(lc, padding=6)
+        left.bind("<Configure>", lambda e: lc.configure(scrollregion=lc.bbox("all")))
+        lc.create_window((0, 0), window=left, anchor="nw")
+        lc.configure(yscrollcommand=lsb.set)
+        lc.pack(side="left", fill="y")
+        lsb.pack(side="right", fill="y")
+
+        def _wheel(e):
+            lc.yview_scroll(-1 if (getattr(e, "delta", 0) > 0 or e.num == 4) else 1, "units")
+
+        def _wheel_on(_e):
+            for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                lc.bind_all(ev, _wheel)
+
+        def _wheel_off(_e):
+            for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                lc.unbind_all(ev)
+        lc.bind("<Enter>", _wheel_on)
+        lc.bind("<Leave>", _wheel_off)
         right = ttk.Frame(self.root)
         right.pack(side="left", fill="both", expand=True)
 
@@ -438,6 +632,7 @@ class App:
         self.trend = tk.BooleanVar(value=False)
         self.means = tk.BooleanVar(value=True)
         self.equal = tk.BooleanVar(value=False)
+        self.flight = tk.BooleanVar(value=False)
         self.kind_cb = self._combo(f, "Type", self.kind, PLOT_KINDS)
         self.x_cb = self._combo(f, "X", self.xv, [])
         self.y_cb = self._combo(f, "Y", self.yv, [])
@@ -447,7 +642,8 @@ class App:
         ttk.Spinbox(r, from_=3, to=100, width=5, textvariable=self.bins,
                     command=self.refresh).pack(side="left", padx=4)
         for text, var in (("Trend line", self.trend), ("Show means", self.means),
-                          ("Equal aspect", self.equal)):
+                          ("Equal aspect", self.equal),
+                          ("Flight lines (Dispersion plot)", self.flight)):
             ttk.Checkbutton(f, text=text, variable=var, command=self.refresh).pack(anchor="w")
         self.face_shape = tk.StringVar(value=FACE_SHAPES[0])
         self.face_w = tk.DoubleVar(value=2.0)
@@ -461,6 +657,23 @@ class App:
         sp.pack(side="left", padx=4)
         sp.bind("<Return>", lambda e: self.refresh())
         ttk.Label(r, text="(HI/VI units)", foreground="#777").pack(side="left")
+
+        # ball flight laws
+        f = ttk.LabelFrame(left, text="Ball flight laws (A-I)", padding=4); f.pack(fill="x", pady=3)
+        self.law_src = tk.StringVar(value=LAW_SOURCES[0])
+        self.face_tol = tk.DoubleVar(value=1.0)
+        self.curve_tol = tk.DoubleVar(value=1.0)
+        self._combo(f, "Start line", self.law_src, LAW_SOURCES)
+        for label, var in (("Start +/- deg", self.face_tol), ("Curve +/- deg", self.curve_tol)):
+            r = ttk.Frame(f); r.pack(fill="x", pady=1)
+            ttk.Label(r, text=label, width=12).pack(side="left")
+            sp = ttk.Spinbox(r, from_=0, to=10, increment=0.25, width=6, textvariable=var,
+                             command=self.refresh)
+            sp.pack(side="left")
+            sp.bind("<Return>", lambda e: self.refresh())
+        ttk.Label(f, text="Start = club face (or HLA) vs target; curve = face-to-path "
+                          "(face - path). Inside the +/- band = 'straight'.",
+                  foreground="#777", wraplength=270, justify="left").pack(anchor="w", pady=(2, 0))
 
         # filters
         f = ttk.LabelFrame(left, text="Range filters", padding=4); f.pack(fill="x", pady=3)
@@ -494,6 +707,10 @@ class App:
         for c in cols:
             self.stats.heading(c, text=c); self.stats.column(c, width=90, anchor="center")
         self.stats.pack(fill="x", padx=6, pady=6)
+        ttk.Label(sf, text="Ball flight laws: shots per category (enabled shots only)").pack(
+            anchor="w", padx=6)
+        self.laws = ttk.Treeview(sf, show="headings", height=9)
+        self.laws.pack(fill="x", padx=6, pady=6)
 
         df_ = ttk.Frame(nb); nb.add(df_, text="Data")
         tb = ttk.Frame(df_); tb.pack(fill="x", padx=4, pady=3)
@@ -540,7 +757,7 @@ class App:
         self.colors = club_colors(self.df)
         num = numeric_columns(self.df)
         self.x_cb["values"] = num; self.y_cb["values"] = num
-        self.c_cb["values"] = ["Club", "(none)"] + num
+        self.c_cb["values"] = ["Club", "Law", "(none)"] + num
         self.fcol_cb["values"] = num
         self.xv.set("Carry" if "Carry" in num else num[0])
         self.yv.set("TotalDistance" if "TotalDistance" in num else num[1])
@@ -596,9 +813,19 @@ class App:
         if self.df is None:
             return
         clubs = [self.club_lb.get(i) for i in self.club_lb.curselection()]
-        self.filtered = filter_df(self.df, clubs, self.filters)
+        ft, ct, src = self._law_params()
+        self.cls = add_flight_laws(self.df, ft, ct, src)
+        self.filtered = filter_df(self.cls, clubs, self.filters)
         self._replot()
         self._fill_table()
+
+    def _law_params(self):
+        def num(var, default):
+            try:
+                return max(float(var.get()), 0.0)
+            except (tk.TclError, ValueError):
+                return default
+        return num(self.face_tol, 1.0), num(self.curve_tol, 1.0), self.law_src.get()
 
     def _replot(self):
         """Redraw plot + stats from filtered shots that are not disabled."""
@@ -607,11 +834,14 @@ class App:
             face_w = max(float(self.face_w.get()), 0.05)
         except (tk.TclError, ValueError):
             face_w = 2.0
+        ft, ct, src = self._law_params()
         opts = dict(kind=self.kind.get(), x=self.xv.get(), y=self.yv.get(),
+                    face_tol=ft, curve_tol=ct, law_src=src,
                     face_shape=self.face_shape.get(), face_w=face_w,
                     heel_pos=(self.hi_pos.get() == "Heel"),
                     color_by=self.cv.get(), bins=self.bins.get(), trend=self.trend.get(),
-                    means=self.means.get(), equal=self.equal.get())
+                    means=self.means.get(), equal=self.equal.get(),
+                    flight_lines=self.flight.get())
         self.annot = None
         self.pts = draw_plot(self.fig, self.active, opts, self.colors)
         self.canvas.draw_idle()
@@ -623,6 +853,7 @@ class App:
     def _fill_stats(self, y):
         self.stats.delete(*self.stats.get_children())
         d = self.active
+        self._fill_laws(d)
         if d.empty or y not in d:
             return
         for club, g in list(d.groupby("Club", sort=False)) + [("ALL", d)]:
@@ -632,6 +863,24 @@ class App:
                                   f"{v.std(ddof=1):.2f}" if len(v) > 1 else "-",
                                   f"{v.min():.2f}", f"{v.median():.2f}", f"{v.max():.2f}"))
 
+    def _fill_laws(self, d):
+        clubs = list(dict.fromkeys(d["Club"])) if len(d) else []
+        cols = ["Law", "Name"] + clubs + ["ALL"]
+        self.laws["columns"] = cols
+        for c in cols:
+            self.laws.heading(c, text=c)
+            self.laws.column(c, width=170 if c == "Name" else 85, stretch=False,
+                             anchor="w" if c == "Name" else "center")
+        self.laws.delete(*self.laws.get_children())
+        if d.empty:
+            return
+        for code in "ABCDEFGHI":
+            row = [code, LAWS[code][0]]
+            for sub_d in [d[d["Club"] == c] for c in clubs] + [d]:
+                n = int((sub_d["Law"] == code).sum())
+                row.append(f"{n}  ({100 * n / len(sub_d):.0f}%)" if n else "-")
+            self.laws.insert("", "end", values=row)
+
     # ---- data tab: sorting + per-row disable
     def _fill_table(self):
         d = self.filtered
@@ -640,7 +889,7 @@ class App:
         for c in cols:
             arrow = (" \u25B2" if self.sort_asc else " \u25BC") if c == self.sort_col else ""
             self.tree.heading(c, text=c + arrow, command=lambda c=c: self._sort_by(c))
-            self.tree.column(c, width=48 if c == "Off" else 88, stretch=False,
+            self.tree.column(c, width=48 if c == "Off" else 120 if c == "LawName" else 88, stretch=False,
                              anchor="center" if c == "Off" else "e")
         self.tree.delete(*self.tree.get_children())
         if self.sort_col == "Off":
